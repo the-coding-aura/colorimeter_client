@@ -1,0 +1,183 @@
+LS170 Colorimeter - Reading Color / Lab Values in a Kotlin Android App
+=======================================================================
+
+ANSWER: YES, it is possible.
+
+The LS170 has no screen. It sends measured color data over Bluetooth Low Energy (BLE)
+to a phone app (official app: LScolor). Your Kotlin app can do the same.
+
+Measured values include CIE Lab (L*, a*, b*) plus Luv, LCh, Yxy, RGB, etc.
+(Lab uses D65 illuminant, 10 degree observer.)
+
+
+WHAT THE DOCUMENTS MEAN
+-----------------------
+1) LS170 User Manual
+   - Data transmission = Bluetooth
+   - App connects by BLE, calibrates, then Scan returns Lab and other color spaces
+   - Official Android support: Android 7.0+
+
+2) Colorimeter_Bluetooth_Communication_Protocol (RF-star CC2640R2F module)
+   - This is the BLE "transparent transmission" (bridge) module inside the device
+   - Phone <-> BLE <-> UART <-> colorimeter MCU
+   - App interface (typical / default module):
+       Write commands  -> Service 0xFFE5 / Characteristic 0xFFE9
+       Receive data    -> Service 0xFFE0 / Characteristic 0xFFE4 (NOTIFY)
+   - Some firmware variants use other UUID pairs (see Step 6)
+
+
+IMPORTANT NOTE
+--------------
+The RF-star PDF defines HOW bytes move over BLE (write / notify).
+It does NOT define the Linshang color packet format (Lab bytes).
+Linshang's upper-layer command/response format is what LScolor uses.
+That format is known from reverse engineering (open-source bluecolor tool)
+and is listed in the command section below.
+
+If you need an official vendor SDK / packet spec, ask Linshang support.
+For practical integration, the BLE path below works on LS170/LS171.
+
+
+STEPS (Kotlin Android)
+----------------------
+
+Step 1. Create Android project (Kotlin)
+  - Min SDK: 24+ recommended (Android 7+ matches official app)
+  - Target recent Android version
+
+Step 2. Add permissions in AndroidManifest.xml
+  - Android 12+ (API 31+):
+      BLUETOOTH_SCAN
+      BLUETOOTH_CONNECT
+      (and declare uses-feature bluetooth_le)
+  - Older Android:
+      BLUETOOTH
+      BLUETOOTH_ADMIN
+      ACCESS_FINE_LOCATION (required for BLE scan on many versions)
+  - Request runtime permissions before scanning
+
+Step 3. Turn on phone Bluetooth and power on LS170
+  - Short press LS170 power button (indicator flashes)
+  - Device advertises a name similar to: LS170xxxxxx (SN)
+
+Step 4. Scan for BLE devices in Kotlin
+  - Use BluetoothManager / BluetoothAdapter / BluetoothLeScanner
+  - Filter by name starting with "LS170" (or by known MAC)
+  - Or filter by advertised service UUID 0xFFE0 / 0xFFE5 when present
+
+Step 5. Connect GATT
+  - device.connectGatt(context, false, gattCallback)
+  - On connection success, call gatt.discoverServices()
+
+Step 6. Find write + notify characteristics
+  Try these UUID pairs (first is the RF-star / most common):
+
+  A) Notify: service 0000FFE0-... / char 0000FFE4-...
+     Write:  service 0000FFE5-... / char 0000FFE9-...
+
+  B) Alternate: service 00001001-... / char 00001002-... (same char for both)
+
+  C) Alternate: service 0000FFF0-... / char 0000FFF1-... (same char for both)
+
+  Use the pair that exists after service discovery.
+
+Step 7. Enable notifications on the notify characteristic
+  - gatt.setCharacteristicNotification(notifyChar, true)
+  - Write ENABLE_NOTIFICATION_VALUE to the CCCD descriptor
+    (UUID 00002902-0000-1000-8000-00805f9b34fb)
+
+Step 8. Send commands by writing bytes to the write characteristic
+  - Prefer WRITE_TYPE_NO_RESPONSE (matches module docs / working clients)
+
+  Known Linshang command frames (hex):
+
+  Scan (measure color):
+    AB 44 00 00 00 00 36 00 18 64
+
+  Calibrate (close white-tile bottom cap first):
+    AB 20 2E 00 02 00 90 4F
+
+  Battery:
+    AB 20 0B 00 02 00 9B 43
+
+  Device info:
+    AB 40 00 00 00 00 14 00 45 04
+
+  Also: short-pressing the LS170 button can trigger a measurement that
+  arrives as a notify payload (same scan result format).
+
+Step 9. Parse notify payloads in onCharacteristicChanged
+  All valid frames start with 0xAB.
+
+  Color scan result:
+    Header starts with AB 44 ...
+    After first 8 bytes, values are little-endian int16 / 100.0:
+
+      Lab: L, a, b
+      Luv: L, u, v
+      LCh: L, C, h
+      Yxy: Y, x, y
+      then 4 unused/CMYK-related bytes
+      then RGB: 3 unsigned bytes (R, G, B)
+
+  Example Lab in app UI:
+    L = 92.59, a = -0.29, b = 0.55
+
+  Other responses:
+    AB 20 2E ...  = calibration OK
+    AB 20 0B ...  = battery (int16 at bytes 6..7)
+    AB 40 00 ...  = device info block
+
+Step 10. Recommended app flow
+  1) Scan + connect to LS170
+  2) Enable notify
+  3) Optional: send Device info + Battery
+  4) Calibrate with bottom cap closed
+  5) Place aperture on sample, send Scan command (or press device button)
+  6) Wait for AB44 notify, parse Lab (and other spaces)
+  7) Display / store / compare values in your app
+  8) Keep connection alive with occasional battery/status if needed
+  9) Disconnect when done
+
+Step 11. Test checklist
+  - Permissions granted
+  - Only one app connected to the LS170 at a time (close LScolor first)
+  - Device within close range; BLE can be flaky on first connect
+  - Calibration before critical measurements
+  - Hold still ~1+ seconds during measurement
+  - Confirm Lab matches LScolor app on same sample
+
+
+MINIMAL KOTLIN FLOW (pseudo)
+----------------------------
+1. scanner.startScan(...)
+2. on device found -> connectGatt
+3. onServicesDiscovered -> find FFE9 (write) and FFE4 (notify)
+4. enable notify on FFE4
+5. write scan command bytes to FFE9
+6. onCharacteristicChanged -> if bytes start with AB44 -> parse Lab
+
+
+SAMPLE RESULT SHAPE
+-------------------
+Lab:  [L, a, b]
+Luv:  [L, u, v]
+LCh:  [L, C, h]
+Yxy:  [Y, x, y]
+RGB:  [R, G, B]
+
+
+REFERENCES
+----------
+- LS170_User_Manual_V2.18.pdf
+- Colorimeter_Bluetooth_Communication_Protocol_211118.pdf (RF-star BLE bridge)
+- Working open implementation (for packet details):
+  https://github.com/virtulis/bluecolor
+
+
+CONCLUSION
+----------
+Yes: a Kotlin Android app can read LS170 color and Lab values over BLE.
+Use Android BLE GATT, write commands to FFE9 (or alternate write UUID),
+subscribe to FFE4 (or alternate notify UUID), and parse AB44 scan frames
+to get Lab / Luv / LCh / Yxy / RGB.

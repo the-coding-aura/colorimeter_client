@@ -1,0 +1,38 @@
+package com.simple.icrpaintsapp
+
+/**
+ * Parsed LS170 color measurement (D65 / 10°).
+ */
+data class ColorScanResult(
+    val l: Double,
+    val a: Double,
+    val b: Double,
+    val r: Int,
+    val g: Int,
+    val blue: Int
+) {
+    val rgbText: String
+        get() = "$r, $g, $blue"
+
+    val labText: String
+        get() = "%.2f, %.2f, %.2f".format(l, a, b)
+
+    /** Friendly labels for UI radios */
+    val rgbFriendly: String
+        get() = "R: $r   G: $g   B: $blue"
+
+    val labFriendly: String
+        get() = "L: %.2f   a: %.2f   b: %.2f".format(l, a, b)
+
+    val rgbHex: String
+        get() = "#%02X%02X%02X".format(r, g, blue)
+
+    val lText: String
+        get() = "%.2f".format(l)
+
+    val aText: String
+        get() = "%.2f".format(a)
+
+    val bText: String
+        get() = "%.2f".format(b)
+}

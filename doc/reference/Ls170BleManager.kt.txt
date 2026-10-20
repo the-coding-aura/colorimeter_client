@@ -1,0 +1,687 @@
+package com.simple.icrpaintsapp
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * LS170 / LS171 BLE client.
+ *
+ * Flow: discover matching devices → user picks one → connect → measure.
+ * Notify payloads are reassembled (default ATT MTU often fragments AB44 frames).
+ */
+class Ls170BleManager(private val context: Context) {
+
+    data class FoundDevice(
+        val name: String,
+        val address: String,
+        val device: BluetoothDevice
+    )
+
+    interface DiscoveryListener {
+        fun onDeviceFound(devices: List<FoundDevice>)
+        fun onDiscoveryFinished(devices: List<FoundDevice>)
+        fun onError(message: String)
+    }
+
+    interface MeasureListener {
+        fun onStatus(message: String)
+        fun onConnected()
+        fun onResult(result: ColorScanResult)
+        fun onError(message: String)
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val bluetoothManager =
+        context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    private val adapter: BluetoothAdapter? = bluetoothManager.adapter
+
+    private var discoveryListener: DiscoveryListener? = null
+    private var measureListener: MeasureListener? = null
+    private var gatt: BluetoothGatt? = null
+    private var writeChar: BluetoothGattCharacteristic? = null
+    private var notifyChar: BluetoothGattCharacteristic? = null
+    private var scanning = false
+    private var awaitingMeasurement = false
+    /**
+     * When true (Color Scan page open), accept AB44 from either:
+     * - App Scan write command, or
+     * - Short-press of the LS170 physical button (unsolicited notify).
+     */
+    private var acceptUnsolicitedResults = false
+    private var scanRetriesLeft = 0
+    private val foundByAddress = ConcurrentHashMap<String, FoundDevice>()
+    private var discoveryTimeoutRunnable: Runnable? = null
+    private var measureTimeoutRunnable: Runnable? = null
+    private var scanRetryRunnable: Runnable? = null
+    private val rxBuffer = ByteArrayOutputStream()
+    private val rxLock = Any()
+
+    fun isBluetoothEnabled(): Boolean = adapter?.isEnabled == true
+
+    fun isConnectedReady(): Boolean =
+        gatt != null && writeChar != null && notifyChar != null
+
+    fun startDiscovery(listener: DiscoveryListener) {
+        this.discoveryListener = listener
+        foundByAddress.clear()
+        stopBleScan()
+
+        val bt = adapter
+        if (bt == null || !bt.isEnabled) {
+            mainHandler.post { listener.onError("Bluetooth is off") }
+            return
+        }
+
+        startBleScanForDiscovery()
+    }
+
+    fun stopDiscovery() {
+        discoveryTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        discoveryTimeoutRunnable = null
+        stopBleScan()
+    }
+
+    /** Connect and prepare notifications; does not start a color measurement. */
+    fun connect(device: BluetoothDevice, listener: MeasureListener) {
+        this.measureListener = listener
+        awaitingMeasurement = false
+        scanRetriesLeft = 0
+        clearRxBuffer()
+        stopDiscovery()
+        cancelMeasureTimers()
+
+        val bt = adapter
+        if (bt == null || !bt.isEnabled) {
+            postMeasureError("Bluetooth is off")
+            return
+        }
+
+        if (gatt != null &&
+            writeChar != null &&
+            notifyChar != null &&
+            gatt?.device?.address.equals(device.address, ignoreCase = true)
+        ) {
+            postMeasureStatus("Already connected")
+            mainHandler.post { measureListener?.onConnected() }
+            return
+        }
+
+        cleanupGatt()
+        postMeasureStatus("Connecting…")
+        connectGatt(device)
+    }
+
+    /**
+     * Keep receiving color results while the Scan page is open.
+     * Needed so a short-press on the LS170 button updates the app
+     * (same AB44 notify as App Scan — see LS170 user manual §4.1).
+     */
+    fun setResultListener(listener: MeasureListener?) {
+        this.measureListener = listener
+        acceptUnsolicitedResults = listener != null
+        if (listener == null) {
+            awaitingMeasurement = false
+            cancelMeasureTimers()
+        }
+    }
+
+    /** Run a color measurement by writing the Scan command (App Scan button). */
+    fun measure(listener: MeasureListener? = null) {
+        if (listener != null) {
+            this.measureListener = listener
+            acceptUnsolicitedResults = true
+        }
+        if (!isConnectedReady()) {
+            postMeasureError("Not connected")
+            return
+        }
+        awaitingMeasurement = true
+        scanRetriesLeft = 2
+        clearRxBuffer()
+        cancelMeasureTimers()
+        postMeasureStatus("Measuring color…")
+        scheduleScanCommand(delayMs = 200L)
+    }
+
+    fun connectAndMeasure(device: BluetoothDevice, listener: MeasureListener) {
+        this.measureListener = listener
+        awaitingMeasurement = true
+        scanRetriesLeft = 2
+        clearRxBuffer()
+        stopDiscovery()
+        cancelMeasureTimers()
+
+        val bt = adapter
+        if (bt == null || !bt.isEnabled) {
+            postMeasureError("Bluetooth is off")
+            return
+        }
+
+        if (gatt != null &&
+            writeChar != null &&
+            notifyChar != null &&
+            gatt?.device?.address.equals(device.address, ignoreCase = true)
+        ) {
+            postMeasureStatus("Measuring color…")
+            mainHandler.post { measureListener?.onConnected() }
+            scheduleScanCommand(delayMs = 200L)
+            return
+        }
+
+        cleanupGatt()
+        postMeasureStatus("Connecting…")
+        connectGatt(device)
+    }
+
+    fun disconnect() {
+        stopDiscovery()
+        cancelMeasureTimers()
+        awaitingMeasurement = false
+        acceptUnsolicitedResults = false
+        measureListener = null
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        writeChar = null
+        notifyChar = null
+        clearRxBuffer()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startBleScanForDiscovery() {
+        val scanner = adapter?.bluetoothLeScanner
+        if (scanner == null) {
+            mainHandler.post { discoveryListener?.onError("BLE scanner unavailable") }
+            return
+        }
+        scanning = true
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        scanner.startScan(null, settings, discoveryScanCallback)
+
+        val timeout = Runnable {
+            if (!scanning) return@Runnable
+            stopBleScan()
+            val list = foundByAddress.values.sortedBy { it.name }
+            mainHandler.post {
+                if (list.isEmpty()) {
+                    discoveryListener?.onError(
+                        "No LS170/LS171 found. Power on the device and close LScolor first."
+                    )
+                } else {
+                    discoveryListener?.onDiscoveryFinished(list)
+                }
+            }
+        }
+        discoveryTimeoutRunnable = timeout
+        mainHandler.postDelayed(timeout, SCAN_TIMEOUT_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopBleScan() {
+        if (!scanning) return
+        scanning = false
+        try {
+            adapter?.bluetoothLeScanner?.stopScan(discoveryScanCallback)
+        } catch (_: Exception) {
+        }
+    }
+
+    private val discoveryScanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            val device = result?.device ?: return
+            val name = device.name ?: result.scanRecord?.deviceName ?: return
+            if (!isLsDevice(name)) return
+            val address = device.address ?: return
+            val entry = FoundDevice(name = name, address = address, device = device)
+            val isNew = foundByAddress.put(address, entry) == null
+            if (isNew) {
+                val list = foundByAddress.values.sortedBy { it.name }
+                mainHandler.post { discoveryListener?.onDeviceFound(list) }
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            scanning = false
+            mainHandler.post { discoveryListener?.onError("BLE scan failed ($errorCode)") }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectGatt(device: BluetoothDevice) {
+        gatt?.close()
+        gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.d(TAG, "onConnectionStateChange status=$status newState=$newState")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                postMeasureError("Connection failed ($status). Close LScolor and retry.")
+                cleanupGatt()
+                return
+            }
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    postMeasureStatus("Connected. Preparing…")
+                    // Larger MTU reduces AB44 fragmentation (still reassemble as fallback).
+                    try {
+                        gatt.requestMtu(247)
+                    } catch (_: Exception) {
+                        gatt.discoverServices()
+                    }
+                }
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    cleanupGatt()
+                    if (awaitingMeasurement) {
+                        postMeasureError("Device disconnected. Close LScolor if it is open.")
+                    }
+                }
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            Log.d(TAG, "onMtuChanged mtu=$mtu status=$status")
+            gatt.discoverServices()
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            Log.d(TAG, "onServicesDiscovered status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                postMeasureError("Service discovery failed")
+                return
+            }
+            if (!resolveCharacteristics(gatt)) {
+                postMeasureError("Colorimeter characteristics not found")
+                return
+            }
+            enableNotifications(gatt)
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            handleNotifyChunk(characteristic.value)
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            handleNotifyChunk(value)
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            Log.d(TAG, "onDescriptorWrite status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                postMeasureError("Failed to enable notifications")
+                return
+            }
+            onReadyToMeasure()
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            Log.d(TAG, "onCharacteristicWrite status=$status uuid=${characteristic.uuid}")
+        }
+    }
+
+    private fun resolveCharacteristics(gatt: BluetoothGatt): Boolean {
+        for ((notifySvc, notifyCh, writeSvc, writeCh) in UUID_PAIRS) {
+            val nChar = gatt.getService(notifySvc)?.getCharacteristic(notifyCh)
+            val wChar = gatt.getService(writeSvc)?.getCharacteristic(writeCh)
+            if (nChar != null && wChar != null) {
+                notifyChar = nChar
+                writeChar = wChar
+                Log.d(TAG, "Using FFE0/FFE4 + FFE5/FFE9")
+                return true
+            }
+        }
+        for ((svc, ch) in SAME_CHAR_PAIRS) {
+            val c = gatt.getService(svc)?.getCharacteristic(ch)
+            if (c != null) {
+                notifyChar = c
+                writeChar = c
+                Log.d(TAG, "Using shared char $ch")
+                return true
+            }
+        }
+        // Dump available services for debugging
+        gatt.services?.forEach { svc ->
+            Log.d(TAG, "Service ${svc.uuid}")
+            svc.characteristics?.forEach { ch ->
+                Log.d(TAG, "  Char ${ch.uuid} props=${ch.properties}")
+            }
+        }
+        return false
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enableNotifications(gatt: BluetoothGatt) {
+        val nChar = notifyChar ?: return
+        val ok = gatt.setCharacteristicNotification(nChar, true)
+        Log.d(TAG, "setCharacteristicNotification=$ok")
+        val cccd = nChar.getDescriptor(CCCD_UUID)
+        if (cccd == null) {
+            Log.w(TAG, "No CCCD; measuring without explicit notify enable")
+            onReadyToMeasure()
+            return
+        }
+        val written = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
+                BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            @Suppress("DEPRECATION")
+            gatt.writeDescriptor(cccd)
+        }
+        if (!written) {
+            postMeasureError("Could not enable notifications")
+        }
+    }
+
+    private fun onReadyToMeasure() {
+        mainHandler.post { measureListener?.onConnected() }
+        if (awaitingMeasurement) {
+            postMeasureStatus("Measuring color…")
+            // Give the UART bridge a moment after CCCD enable (matches working clients).
+            scheduleScanCommand(delayMs = 400L)
+        }
+    }
+
+    private fun scheduleScanCommand(delayMs: Long) {
+        scanRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            if (!awaitingMeasurement) return@Runnable
+            clearRxBuffer()
+            if (!writeBytes(SCAN_COMMAND)) {
+                postMeasureError("Failed to send scan command")
+                return@Runnable
+            }
+            Log.d(TAG, "Scan command written; waiting for AB44…")
+            armMeasureTimeout()
+        }
+        scanRetryRunnable = runnable
+        mainHandler.postDelayed(runnable, delayMs)
+    }
+
+    private fun armMeasureTimeout() {
+        measureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            if (!awaitingMeasurement) return@Runnable
+            if (scanRetriesLeft > 0) {
+                scanRetriesLeft--
+                Log.w(TAG, "No AB44 yet; retrying scan ($scanRetriesLeft left)")
+                postMeasureStatus("Measuring… retrying")
+                scheduleScanCommand(delayMs = 300L)
+            } else {
+                awaitingMeasurement = false
+                postMeasureError(
+                    "No measurement received. Close LScolor, hold still on sample, or press the LS170 button once."
+                )
+            }
+        }
+        measureTimeoutRunnable = runnable
+        mainHandler.postDelayed(runnable, MEASURE_TIMEOUT_MS)
+    }
+
+    private fun cancelMeasureTimers() {
+        measureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        measureTimeoutRunnable = null
+        scanRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        scanRetryRunnable = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeBytes(payload: ByteArray): Boolean {
+        val g = gatt ?: return false
+        val w = writeChar ?: return false
+        val props = w.properties
+        val noRsp = props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+        val writeType = if (noRsp) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
+        Log.d(TAG, "writeBytes len=${payload.size} type=$writeType hex=${payload.toHex()}")
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeCharacteristic(w, payload, writeType) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            w.writeType = writeType
+            @Suppress("DEPRECATION")
+            w.value = payload
+            @Suppress("DEPRECATION")
+            g.writeCharacteristic(w)
+        }
+    }
+
+    private fun handleNotifyChunk(chunk: ByteArray?) {
+        if (chunk == null || chunk.isEmpty()) return
+        Log.d(TAG, "notify chunk len=${chunk.size} hex=${chunk.toHex()}")
+
+        var completed: ByteArray? = null
+        synchronized(rxLock) {
+            // New frame start resets buffer
+            if (chunk[0] == 0xAB.toByte()) {
+                rxBuffer.reset()
+            }
+            rxBuffer.write(chunk)
+            val buf = rxBuffer.toByteArray()
+            if (buf.size >= 3 && buf[0] == 0xAB.toByte()) {
+                val needed = expectedFrameLength(buf)
+                if (needed > 0 && buf.size >= needed) {
+                    completed = buf.copyOf(needed)
+                    rxBuffer.reset()
+                    if (buf.size > needed) {
+                        rxBuffer.write(buf, needed, buf.size - needed)
+                    }
+                }
+            }
+        }
+
+        val frame = completed ?: return
+        Log.d(TAG, "complete frame len=${frame.size} hex=${frame.toHex()}")
+        handleCompleteFrame(frame)
+    }
+
+    /**
+     * Infer full frame size from Linshang header.
+     * AB44 color result needs at least 39 bytes (header 8 + 12×int16 + 4 + RGB3).
+     */
+    private fun expectedFrameLength(buf: ByteArray): Int {
+        if (buf.size < 2) return -1
+        return when {
+            buf[1] == 0x44.toByte() -> {
+                // Prefer length field at bytes 6..7 when present (LE), else min size.
+                if (buf.size >= 8) {
+                    val declared = ByteBuffer.wrap(buf, 6, 2)
+                        .order(ByteOrder.LITTLE_ENDIAN)
+                        .short
+                        .toInt() and 0xFFFF
+                    // Some firmwares put payload length here (e.g. 0x0036).
+                    val total = if (declared in 30..200) declared + 8 else COLOR_FRAME_MIN
+                    maxOf(COLOR_FRAME_MIN, total)
+                } else {
+                    COLOR_FRAME_MIN
+                }
+            }
+            buf[1] == 0x20.toByte() -> 10
+            buf[1] == 0x40.toByte() -> 40
+            else -> {
+                if (buf.size >= 8) {
+                    val declared = ByteBuffer.wrap(buf, 6, 2)
+                        .order(ByteOrder.LITTLE_ENDIAN)
+                        .short
+                        .toInt() and 0xFFFF
+                    if (declared in 4..200) declared + 8 else -1
+                } else {
+                    -1
+                }
+            }
+        }
+    }
+
+    private fun handleCompleteFrame(frame: ByteArray) {
+        if (frame[0] != 0xAB.toByte()) return
+        when (frame[1]) {
+            0x44.toByte() -> {
+                val parsed = parseAb44(frame) ?: run {
+                    Log.w(TAG, "AB44 parse failed len=${frame.size}")
+                    return
+                }
+                // Accept App-triggered measure OR LS170 physical button (unsolicited AB44).
+                if (!awaitingMeasurement && !acceptUnsolicitedResults) {
+                    Log.d(TAG, "Got AB44 but Scan page is not listening")
+                    return
+                }
+                val fromDeviceButton = !awaitingMeasurement
+                awaitingMeasurement = false
+                cancelMeasureTimers()
+                Log.d(
+                    TAG,
+                    "Scan OK source=${if (fromDeviceButton) "device-button" else "app-scan"} " +
+                        "Lab=${parsed.labText} RGB=${parsed.rgbText}"
+                )
+                mainHandler.post { measureListener?.onResult(parsed) }
+            }
+            0x20.toByte() -> {
+                if (frame.size >= 3 && frame[2] == 0x0B.toByte()) {
+                    Log.d(TAG, "Battery response received (notify path OK)")
+                } else if (frame.size >= 3 && frame[2] == 0x2E.toByte()) {
+                    Log.d(TAG, "Calibration response received")
+                }
+            }
+            0x40.toByte() -> Log.d(TAG, "Device info response received")
+            else -> Log.w(TAG, "Unknown AB frame type=0x${"%02X".format(frame[1])}")
+        }
+    }
+
+    private fun parseAb44(data: ByteArray): ColorScanResult? {
+        if (data.size < COLOR_FRAME_MIN) return null
+        val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        buf.position(8)
+        fun nextScaled(): Double = buf.short.toInt() / 100.0
+        val l = nextScaled()
+        val a = nextScaled()
+        val b = nextScaled()
+        // Skip Luv, LCh, Yxy (9 int16) + 4 padding
+        buf.position(8 + 6 + 18 + 4)
+        if (buf.remaining() < 3) return null
+        val r = buf.get().toInt() and 0xFF
+        val g = buf.get().toInt() and 0xFF
+        val blue = buf.get().toInt() and 0xFF
+        return ColorScanResult(l, a, b, r, g, blue)
+    }
+
+    private fun clearRxBuffer() {
+        synchronized(rxLock) { rxBuffer.reset() }
+    }
+
+    private fun cleanupGatt() {
+        try {
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        writeChar = null
+        notifyChar = null
+        clearRxBuffer()
+    }
+
+    private fun postMeasureStatus(msg: String) {
+        mainHandler.post { measureListener?.onStatus(msg) }
+    }
+
+    private fun postMeasureError(msg: String) {
+        awaitingMeasurement = false
+        cancelMeasureTimers()
+        mainHandler.post { measureListener?.onError(msg) }
+    }
+
+    private fun isLsDevice(name: String): Boolean {
+        return name.startsWith("LS170", ignoreCase = true) ||
+            name.startsWith("LS171", ignoreCase = true)
+    }
+
+    private fun ByteArray.toHex(): String =
+        joinToString(" ") { "%02X".format(it) }
+
+    companion object {
+        private const val TAG = "Ls170Ble"
+        private const val SCAN_TIMEOUT_MS = 12_000L
+        private const val MEASURE_TIMEOUT_MS = 6_000L
+        private const val COLOR_FRAME_MIN = 39
+
+        private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        private val UUID_PAIRS = listOf(
+            Quad(
+                UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb"),
+                UUID.fromString("0000ffe4-0000-1000-8000-00805f9b34fb"),
+                UUID.fromString("0000ffe5-0000-1000-8000-00805f9b34fb"),
+                UUID.fromString("0000ffe9-0000-1000-8000-00805f9b34fb")
+            )
+        )
+
+        private val SAME_CHAR_PAIRS = listOf(
+            UUID.fromString("00001001-0000-1000-8000-00805f9b34fb") to
+                UUID.fromString("00001002-0000-1000-8000-00805f9b34fb"),
+            UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb") to
+                UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb")
+        )
+
+        /** Linshang Scan command (same as bluecolor / LScolor) */
+        private val SCAN_COMMAND = byteArrayOf(
+            0xAB.toByte(), 0x44, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x18, 0x64
+        )
+    }
+
+    private data class Quad(
+        val notifyService: UUID,
+        val notifyChar: UUID,
+        val writeService: UUID,
+        val writeChar: UUID
+    )
+}
