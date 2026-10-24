@@ -1,9 +1,8 @@
 name: colorimeter_client
 description: >-
-  Android BLE client for the Linshang LS170 / LS171 colorimeter: scan, connect,
-  measure Lab/Luv/LCh/Yxy/RGB, battery, device info, calibration, ΔE color
-  difference, QC and chart matching.
-version: 0.1.0
+  Android BLE client for Linshang LS170 and LS171 colorimeters: scan, measure,
+  calibrate, and compare colors.
+version: 0.1.1
 repository: https://github.com/the-coding-aura/colorimeter_client
 issue_tracker: https://github.com/the-coding-aura/colorimeter_client/issues
 homepage: https://github.com/the-coding-aura/colorimeter_client

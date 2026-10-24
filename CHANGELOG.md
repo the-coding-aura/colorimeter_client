@@ -5,6 +5,10 @@
 - Other operating systems, including iOS and desktop.
 - Built-in options for other colorimeter devices.
 
+## 0.1.1
+
+- Shorten the package description so it fits pub.dev's 60–180 character limit.
+
 ## 0.1.0
 
 Initial release (Android, BLE only).
