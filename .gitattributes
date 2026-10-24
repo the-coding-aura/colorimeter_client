@@ -1,0 +1,7 @@
+# Dart/dartdoc (9.0.4) mis-handles @docImport offsets in CRLF files.
+* text=auto eol=lf
+*.png binary
+*.pdf binary
+*.otf binary
+*.jar binary
+*.bin binary

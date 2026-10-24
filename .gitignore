@@ -28,6 +28,21 @@ migrate_working_dir/
 /pubspec.lock
 **/doc/api/
 .dart_tool/
+.flutter-plugins
 .flutter-plugins-dependencies
+.pub-cache/
+.pub/
 /build/
 /coverage/
+
+# Symbolication and obfuscation output
+app.*.symbols
+app.*.map.json
+
+# Machine-local SDK paths and signing material
+**/local.properties
+**/key.properties
+**/*.keystore
+**/*.jks
+**/.cxx/
+**/captures/

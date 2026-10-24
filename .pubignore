@@ -1,0 +1,45 @@
+# If .pubignore exists, pub uses it instead of .gitignore. Keep both in sync
+# plus extra exclusions for internal design notes and vendor PDFs.
+
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+*.iml
+*.ipr
+*.iws
+.idea/
+/pubspec.lock
+**/doc/api/
+**/.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+**/build/
+**/.gradle/
+/coverage/
+app.*.symbols
+app.*.map.json
+**/ios/Flutter/.last_build_id
+
+# Machine-local SDK paths and signing material
+**/local.properties
+**/key.properties
+**/*.keystore
+**/*.jks
+**/.cxx/
+**/captures/
+
+# Internal — keep in git, not on pub.dev.
+doc/
+.github/
+.gitattributes
