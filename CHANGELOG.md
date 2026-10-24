@@ -1,5 +1,10 @@
 # Changelog
 
+## Upcoming
+
+- Other operating systems, including iOS and desktop.
+- Built-in options for other colorimeter devices.
+
 ## 0.1.0
 
 Initial release (Android, BLE only).

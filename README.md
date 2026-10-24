@@ -6,13 +6,26 @@ into typed models, and provides the color math an app needs around a reading: co
 ΔE formula of the instrument, PASS/NG quality control, nearest-color chart matching, and
 "My Colors" / "Compare History" storage with same-model JSON import/export.
 
-| Platform | Supported |
+| Platform | This release (0.1.0) |
 | --- | --- |
-| Android (API 24+) | Yes, BLE only |
-| iOS, web, desktop | No (not declared in `pubspec.yaml`) |
+| Android (API 24+) | Supported, BLE only |
+| Other operating systems | Planned. See [Roadmap](#roadmap). |
+
+## Roadmap
+
+Version 0.1.0 targets Android and ships with the Linshang LS170 and LS171.
+
+Later versions will add:
+
+- Support for other operating systems, including iOS and desktop.
+- Built-in options for other colorimeter devices.
+
+Another instrument can already be configured before those built-in options exist. See
+[Adding another instrument](#adding-another-instrument).
 
 ## Contents
 
+- [Roadmap](#roadmap)
 - [Installation](#installation)
 - [Android permissions](#android-permissions)
 - [BLE versus Bluetooth Classic](#ble-versus-bluetooth-classic)
@@ -73,7 +86,7 @@ Because `BLUETOOTH_SCAN` uses `neverForLocation`, scan results can't be used to 
 If your app does need location from BLE scans, override the permission in your own manifest with
 `tools:remove="android:usesPermissionFlags"`.
 
-**iOS** is out of scope. When iOS support is added, the app will need
+iOS support is planned for a later version. When it ships, the app will need
 `NSBluetoothAlwaysUsageDescription` in `Info.plist`.
 
 ## BLE versus Bluetooth Classic
@@ -342,9 +355,12 @@ You can supply your own `ColorimeterTransport` (for example one built on another
 
 ## Device compatibility
 
-Built in today: **Linshang LS170 and LS171**. They advertise names that start with `LS170` or
-`LS171` (for example `LS170A0001`; the suffix is `serialNumber`) and share one BLE protocol, so
-they are one [device profile](#adding-another-instrument).
+Built in for 0.1.0: **Linshang LS170 and LS171**. Later versions will add built-in options for
+other colorimeter devices. See [Roadmap](#roadmap).
+
+LS170 and LS171 advertise names that start with `LS170` or `LS171` (for example `LS170A0001`;
+the suffix is `serialNumber`) and share one BLE protocol, so they are one
+[device profile](#adding-another-instrument).
 
 - **GATT layouts tried in order:** `FFE0` service with notify `FFE4` and write `FFE9` (on `FFE5`);
   `1001` with shared characteristic `1002`; `FFF0` with shared characteristic `FFF1`.
