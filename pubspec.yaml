@@ -4,6 +4,9 @@ description: >-
   measure Lab/Luv/LCh/Yxy/RGB, battery, device info, calibration, ΔE color
   difference, QC and chart matching.
 version: 0.1.0
+repository: https://github.com/the-coding-aura/colorimeter_client
+issue_tracker: https://github.com/the-coding-aura/colorimeter_client/issues
+homepage: https://github.com/the-coding-aura/colorimeter_client
 topics:
   - bluetooth
   - ble
